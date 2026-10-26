@@ -1,0 +1,42 @@
+name: content
+
+# Daily refresh of docs/content.json (served by GitHub Pages to the TV). Off the top of the hour, where GitHub delays
+# or drops scheduled runs. A source that fails keeps its previous data (marked in "stale") and fails the job.
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ["content.py", "test_content.py", ".github/workflows/content.yml"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: content
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Golden tests
+        run: python -m unittest -v test_content
+      - name: Build content.json
+        env:
+          TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
+        run: python content.py || echo "CONTENT_FAILED=1" >> "$GITHUB_ENV"
+      - name: Commit data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/content.json cache/tmdb_map.json
+          git diff --cached --quiet || { git commit -q -m "data $(date -u +%F)" && git push -q; }
+      - name: Fail if a source failed
+        run: test -z "${CONTENT_FAILED:-}"
