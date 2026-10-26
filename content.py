@@ -7,7 +7,9 @@ Regole concordate con Lorenzo (24-26 ott 2026):
                   italiana); lingua originale inglese o europea (no coreane, anime, indiane); disponibili sui servizi
                   attivi. Ordine: voto IMDb, poi voti. "all" = prime 100; per ogni genere IMDb le prime fino a 100.
   Novita          serie nuove o nuove stagioni USCITE negli ultimi 30 giorni, per servizio (stesso filtro lingua del
-                  pool). Non "aggiunte al catalogo": quel dato gratis non esiste.
+                  pool). Non "aggiunte al catalogo": quel dato gratis non esiste. Le nuove stagioni contano solo per
+                  serie partite dal 2018 con voto IMDb almeno 7 (via i procedurali lunghi tipo Law & Order, NCIS);
+                  con meno di 1.000 voti il voto non e affidabile e la stagione non entra.
   Top 10          classifica ufficiale Netflix Italia, settimana piu recente, solo serie TV.
 
 Il file pubblico contiene solo ID e posizioni (niente voti IMDb, testi o immagini TMDB): i dettagli li scarica la TV
@@ -23,7 +25,9 @@ import io
 import json
 import os
 import re
+import shutil
 import sys
+import tempfile
 import time
 import unicodedata
 import urllib.error
@@ -49,6 +53,7 @@ ALLOWED_LANGS = {"en", "it", "es", "fr", "de", "pt", "nl", "sv", "no", "nb", "da
                  "cy", "sq", "mk", "mt", "lb"}
 MIN_VOTES, MIN_VOTES_IT, FIRST_YEAR = 25000, 5000, 2020
 POOL_ALL, POOL_PER_GENRE, NOVITA_DAYS, NOVITA_MAX = 100, 100, 30, 20
+SEASON_FIRST_YEAR, SEASON_MIN_RATING, SEASON_MIN_VOTES = 2018, 7.0, 1000
 GENRES = {  # IMDb -> (codice, etichetta)
     "Drama": ("drammatico", "Drammatico"), "Action": ("azione", "Azione"), "Comedy": ("commedia", "Commedia"),
     "Crime": ("crime", "Crime"), "Mystery": ("mistero", "Mistero"), "Adventure": ("avventura", "Avventura"),
@@ -147,6 +152,21 @@ def novita_kind(details, today, days=NOVITA_DAYS):
     return None, None
 
 
+def season_counts(first_air_date, imdb_rating):
+    """Una nuova stagione entra nelle Novita? Serie partita dal 2018 e voto IMDb >= 7 con almeno 1.000 voti.
+    imdb_rating: (voto, voti) oppure None se IMDb non la conosce."""
+    try:
+        year = int((first_air_date or "")[:4])
+    except ValueError:
+        return False
+    return (year >= SEASON_FIRST_YEAR and imdb_rating is not None
+            and imdb_rating[0] >= SEASON_MIN_RATING and imdb_rating[1] >= SEASON_MIN_VOTES)
+
+
+def log(msg):
+    print(f"[{dt.datetime.now(dt.timezone.utc):%H:%M:%S}] {msg}", flush=True)
+
+
 # ----------------------------------------------------------------------------------------------- rete
 
 def http(url, headers=None, tries=4, timeout=60):
@@ -180,28 +200,43 @@ def tmdb_services(tmdb_id):
 
 # ----------------------------------------------------------------------------------------------- sorgenti
 
-def imdb_candidates(imdb_dir=None):
-    """Serie/miniserie dal 2020 con almeno MIN_VOTES_IT voti (la soglia piena si applica dopo, con la lingua)."""
-    def open_gz(name):
-        if imdb_dir:
-            return gzip.open(Path(imdb_dir) / name, "rt", encoding="utf-8")
-        return io.TextIOWrapper(gzip.GzipFile(fileobj=io.BytesIO(http(IMDB_BASE + name, timeout=600))), encoding="utf-8")
+def imdb_files(imdb_dir=None):
+    """Cartella con i due .tsv.gz di IMDb: quella data, oppure li scarica (in streaming su disco) in una temporanea."""
+    if imdb_dir:
+        return Path(imdb_dir)
+    d = Path(tempfile.mkdtemp(prefix="imdb-"))
+    for name in ("title.ratings.tsv.gz", "title.basics.tsv.gz"):
+        req = urllib.request.Request(IMDB_BASE + name, headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=120) as r, open(d / name, "wb") as f:
+            shutil.copyfileobj(r, f, 1 << 20)
+        log(f"IMDb {name}: {(d / name).stat().st_size // 1_000_000} MB")
+    return d
 
-    ratings = {}
-    with open_gz("title.ratings.tsv.gz") as f:
+
+def imdb_ratings(d, min_votes=SEASON_MIN_VOTES):
+    """tconst -> (voto, voti), solo titoli con almeno min_votes voti."""
+    out = {}
+    with gzip.open(d / "title.ratings.tsv.gz", "rt", encoding="utf-8") as f:
         next(f)
         for line in f:
             t, avg, n = line.rstrip("\n").split("\t")
-            if int(n) >= MIN_VOTES_IT:
-                ratings[t] = (float(avg), int(n))
+            if int(n) >= min_votes:
+                out[t] = (float(avg), int(n))
+    return out
+
+
+def imdb_candidates(d, ratings):
+    """Serie/miniserie dal 2020 con almeno MIN_VOTES_IT voti (la soglia piena si applica dopo, con la lingua)."""
     out = []
-    with open_gz("title.basics.tsv.gz") as f:
+    with gzip.open(d / "title.basics.tsv.gz", "rt", encoding="utf-8") as f:
         next(f)
         for line in f:
             p = line.rstrip("\n").split("\t")
             if p[1] not in ("tvSeries", "tvMiniSeries") or p[0] not in ratings or p[5] == IMDB_NULL or int(p[5]) < FIRST_YEAR:
                 continue
             avg, n = ratings[p[0]]
+            if n < MIN_VOTES_IT:
+                continue
             out.append({"imdb": p[0], "type": p[1], "start": int(p[5]), "rating": avg, "votes": n,
                         "genres": [] if p[8] == IMDB_NULL else p[8].split(",")})
     return out
@@ -221,8 +256,9 @@ def map_tmdb(cands, cache):
     return cache
 
 
-def section_pool(imdb_dir, cache):
-    cands = imdb_candidates(imdb_dir)
+def section_pool(d, ratings, cache):
+    cands = imdb_candidates(d, ratings)
+    log(f"pool: {len(cands)} candidate IMDb, {sum(c['imdb'] not in cache for c in cands)} da mappare su TMDB")
     map_tmdb(cands, cache)
     ok = [dict(c, **cache[c["imdb"]]) for c in cands
           if cache[c["imdb"]]["tmdb"] and eligible(c, cache[c["imdb"]]["lang"])]
@@ -249,7 +285,9 @@ def netflix_ids(tmdb_ids):
 
 
 def section_top10():
-    week, rows = top10_rows(http(NETFLIX_TSV, timeout=300).decode("utf-8"))
+    raw = http(NETFLIX_TSV, timeout=120, tries=3)
+    log(f"Netflix TSV: {len(raw) // 1_000_000} MB")
+    week, rows = top10_rows(raw.decode("utf-8"))
     for r in rows:
         res = tmdb("/search/tv", query=r["title"], language="en-US").get("results", [])[:8]
         on_nf = {x["id"] for x in res if "netflix" in tmdb_services(x["id"])}
@@ -262,7 +300,7 @@ def section_top10():
     return {"week": week, "items": items}
 
 
-def section_novita(today):
+def section_novita(today, ratings):
     out = {}
     lo = (today - dt.timedelta(days=NOVITA_DAYS)).isoformat()
     for svc, v in SERVICES.items():
@@ -275,12 +313,18 @@ def section_novita(today):
                 if r["id"] in seen or r.get("original_language") not in ALLOWED_LANGS:
                     continue
                 seen.add(r["id"])
-                kind, season = novita_kind(tmdb(f"/tv/{r['id']}"), today)
+                details = tmdb(f"/tv/{r['id']}", append_to_response="external_ids")
+                kind, season = novita_kind(details, today)
+                if kind == "new_season":
+                    imdb = (details.get("external_ids") or {}).get("imdb_id")
+                    if not season_counts(details.get("first_air_date"), ratings.get(imdb)):
+                        continue
                 if kind:
                     picked.append({"tmdb": r["id"], "kind": kind, "season": season})
             if len(picked) >= NOVITA_MAX or not res:
                 break
         out[svc] = picked[:NOVITA_MAX]
+        log(f"novita {svc}: {len(out[svc])}")
     return out
 
 
@@ -299,18 +343,31 @@ def main():
             "credits": "Dati: TMDB (non approvato ne certificato da TMDB), JustWatch via TMDB, IMDb (uso personale), "
                        "Netflix Top 10, Wikidata.",
             "stale": {}}
-    jobs = {"top10_netflix": ("netflix", section_top10), "novita": ("novita", lambda: section_novita(today)),
-            "pool": ("pool", lambda: section_pool(args.imdb_dir, cache))}
     failed = False
+    imdb = {}
+
+    def imdb_data():
+        """(cartella, voti) di IMDb, scaricati una volta sola per Novita e pool."""
+        if not imdb:
+            imdb["dir"] = imdb_files(args.imdb_dir)
+            imdb["ratings"] = imdb_ratings(imdb["dir"])
+            log(f"IMDb: {len(imdb['ratings'])} titoli con almeno {SEASON_MIN_VOTES} voti")
+        return imdb["dir"], imdb["ratings"]
+
+    jobs = {"top10_netflix": ("netflix", section_top10),
+            "novita": ("novita", lambda: section_novita(today, imdb_data()[1])),
+            "pool": ("pool", lambda: section_pool(*imdb_data(), cache))}
     for key, (flag, fn) in jobs.items():
         if flag in args.skip:
             data[key] = old.get(key)
             data["stale"][key] = "skipped"
             continue
+        log(f"{key}: inizio")
         try:
             data[key] = fn()
+            log(f"{key}: ok")
         except Exception as e:  # una fonte giu non deve buttare via le altre: si tiene il dato precedente
-            print(f"{key}: ERRORE {e!r}", file=sys.stderr)
+            log(f"{key}: ERRORE {e!r}")
             data[key] = old.get(key)
             data["stale"][key] = f"{type(e).__name__}"
             failed = True

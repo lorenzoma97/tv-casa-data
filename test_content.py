@@ -103,5 +103,23 @@ class Novita(unittest.TestCase):
                 self.assertEqual(c.novita_kind(details, TODAY), want)
 
 
+class NuoveStagioni(unittest.TestCase):
+    def test_solo_serie_recenti_e_buone(self):
+        cases = [
+            ("1999-09-20", (8.1, 140000), False),   # Law & Order SVU: serie troppo vecchia
+            ("2003-09-23", (7.8, 210000), False),   # NCIS
+            ("2021-01-08", (7.5, 150000), True),    # Lupin
+            ("2023-04-20", (8.0, 90000), True),     # The Diplomat
+            ("2020-05-01", (6.4, 30000), False),    # recente ma voto sotto 7
+            ("2018-01-01", (7.0, 1000), True),      # bordi inclusi
+            ("2022-02-02", (8.9, 999), False),      # voto non affidabile
+            ("2022-02-02", None, False),            # IMDb non la conosce
+            (None, (8.0, 50000), False),            # data mancante
+        ]
+        for first, rating, want in cases:
+            with self.subTest(first=first, rating=rating):
+                self.assertEqual(c.season_counts(first, rating), want)
+
+
 if __name__ == "__main__":
     unittest.main()
