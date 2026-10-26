@@ -279,8 +279,12 @@ def netflix_ids(tmdb_ids):
         return {}
     values = " ".join(f'"{i}"' for i in tmdb_ids)
     q = f'SELECT ?t ?n WHERE {{ VALUES ?t {{ {values} }} ?i wdt:P4983 ?t ; wdt:P1874 ?n . }}'
-    data = json.loads(http(f"{WIKIDATA}?{urllib.parse.urlencode({'query': q, 'format': 'json'})}",
-                           headers={"Accept": "application/sparql-results+json"}))
+    # POST and a short timeout: a long GET to the query service once hung the whole Actions job for 30 minutes.
+    req = urllib.request.Request(WIKIDATA, data=urllib.parse.urlencode({"query": q}).encode(), method="POST",
+                                 headers={"User-Agent": UA, "Accept": "application/sparql-results+json",
+                                          "Content-Type": "application/x-www-form-urlencoded"})
+    with urllib.request.urlopen(req, timeout=25) as r:
+        data = json.loads(r.read())
     return {int(b["t"]["value"]): b["n"]["value"] for b in data["results"]["bindings"]}
 
 
@@ -375,9 +379,15 @@ def main():
     try:
         want = sorted({i["tmdb"] for i in (data.get("pool") or {}).get("items", []) if "netflix" in i["s"]}
                       | {i["tmdb"] for i in (data.get("novita") or {}).get("netflix", [])})
-        nf = {}
-        for k in range(0, len(want), 150):
-            nf.update(netflix_ids(want[k:k + 150]))
+        nf, deadline = {}, time.time() + 120
+        for k in range(0, len(want), 40):
+            if time.time() > deadline:
+                log("ID Netflix: tempo scaduto, continuo senza i restanti")
+                break
+            try:
+                nf.update(netflix_ids(want[k:k + 40]))
+            except Exception as e:
+                log(f"ID Netflix: blocco {k // 40 + 1} saltato ({type(e).__name__})")
         for i in (data.get("pool") or {}).get("items", []):
             if i["tmdb"] in nf:
                 i["nf"] = nf[i["tmdb"]]
