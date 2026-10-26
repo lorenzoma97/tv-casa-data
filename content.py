@@ -371,6 +371,22 @@ def main():
             data[key] = old.get(key)
             data["stale"][key] = f"{type(e).__name__}"
             failed = True
+    # ID Netflix (Wikidata) anche per pool e novita su Netflix: "Guarda" apre il titolo, non solo l'app.
+    try:
+        want = sorted({i["tmdb"] for i in (data.get("pool") or {}).get("items", []) if "netflix" in i["s"]}
+                      | {i["tmdb"] for i in (data.get("novita") or {}).get("netflix", [])})
+        nf = {}
+        for k in range(0, len(want), 150):
+            nf.update(netflix_ids(want[k:k + 150]))
+        for i in (data.get("pool") or {}).get("items", []):
+            if i["tmdb"] in nf:
+                i["nf"] = nf[i["tmdb"]]
+        for i in (data.get("novita") or {}).get("netflix", []):
+            if i["tmdb"] in nf:
+                i["nf"] = nf[i["tmdb"]]
+        log(f"ID Netflix: {len(nf)} su {len(want)}")
+    except Exception as e:
+        log(f"ID Netflix: ERRORE {e!r} (Guarda aprira solo l'app)")
     CACHE.parent.mkdir(parents=True, exist_ok=True)
     CACHE.write_text(json.dumps(cache, sort_keys=True, separators=(",", ":")), encoding="utf-8")
     OUT.parent.mkdir(parents=True, exist_ok=True)
