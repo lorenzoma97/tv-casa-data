@@ -129,7 +129,7 @@ class PoolSenzaSerieSparite(unittest.TestCase):
                  {"imdb": "tt2", "type": "tvSeries", "start": 2021, "rating": 7.5, "votes": 90000, "genres": ["Drama"]}]
         cache = {"tt1": {"tmdb": 1, "lang": "en"}, "tt2": {"tmdb": 2, "lang": "en"}}
 
-        def services(tmdb_id):
+        def services(tmdb_id, kind="tv"):
             if tmdb_id == 2:
                 raise urllib.error.HTTPError("u", 404, "Not Found", None, None)
             return ["hbomax"]
@@ -139,6 +139,173 @@ class PoolSenzaSerieSparite(unittest.TestCase):
         self.assertEqual(pool["all"], [1])
         self.assertEqual(pool["items"][0]["s"], ["hbomax"])
         self.assertNotIn("tt2", cache)                         # si rimappa alla prossima corsa
+
+
+class Film(unittest.TestCase):
+    def test_soglie_film(self):
+        cases = [
+            (cand(25000, typ="movie"), "en", True),
+            (cand(24999, typ="movie"), "en", False),
+            (cand(5000, typ="movie"), "it", True),
+            (cand(4999, typ="movie"), "it", False),
+            (cand(400000, typ="movie"), "ko", False),
+            (cand(90000, start=2019, typ="movie"), "en", False),
+            (cand(90000, typ="tvSeries"), "en", False),       # una serie non entra nel pool film
+            (cand(90000, typ="tvMovie"), "en", False),        # film TV fuori (regola da validare)
+        ]
+        for row, lang, want in cases:
+            with self.subTest(row=row, lang=lang):
+                self.assertEqual(c.eligible(row, lang, "movie"), want)
+        self.assertFalse(c.eligible(cand(90000, typ="movie"), "en"))  # e un film non entra nel pool serie
+
+    def test_righe_film_della_top10(self):
+        week, rows = c.top10_rows(Top10.TSV, category="Films")
+        self.assertEqual(week, "2026-10-19")
+        self.assertEqual([(r["rank"], r["title"], r["season"]) for r in rows], [(1, "A Film", None)])
+
+    def test_pick_match_film(self):
+        res = [{"id": 10, "title": "Frankenstein", "original_title": "Frankenstein", "popularity": 900},
+               {"id": 11, "title": "Frankenstein", "original_title": "Frankenstein", "popularity": 40},
+               {"id": 12, "title": "Il ragazzo", "original_title": "The Boy", "popularity": 5}]
+        fields = c.KINDS["movie"]["titles"]
+        self.assertEqual(c.pick_match("Frankenstein", res, {11}, fields), 11)
+        self.assertEqual(c.pick_match("Frankenstein", res, set(), fields), 10)
+        self.assertEqual(c.pick_match("The Boy", res, set(), fields), 12)          # titolo originale
+        self.assertIsNone(c.pick_match("Frankenstein", res, set()))                # campi delle serie: nessun match
+
+
+class CacheSerieFilm(unittest.TestCase):
+    def test_una_serie_non_si_legge_come_film(self):
+        cache = {"tt1": {"tmdb": 1, "lang": "en"},                       # voce storica: serie
+                 "tt2": {"tmdb": 2, "lang": "en", "kind": "movie"}}
+        self.assertEqual(c.cached(cache, "tt1", "tv")["tmdb"], 1)
+        self.assertIsNone(c.cached(cache, "tt1", "movie"))
+        self.assertEqual(c.cached(cache, "tt2", "movie")["tmdb"], 2)
+        self.assertIsNone(c.cached(cache, "tt2", "tv"))
+        self.assertIsNone(c.cached(cache, "tt3", "tv"))
+
+    def test_map_film_usa_movie_results_e_non_tocca_le_serie(self):
+        from unittest import mock
+        cache = {"tt1": {"tmdb": 1, "lang": "en"}, "tt2": {"tmdb": 99, "lang": "en"}}   # tt2 in cache come serie
+        calls = []
+
+        def fake(path, **params):
+            calls.append(path)
+            return {"tv_results": [{"id": 555, "original_language": "en"}],
+                    "movie_results": [{"id": 777, "original_language": "it"}]}
+
+        with mock.patch.object(c, "tmdb", fake):
+            c.map_tmdb([{"imdb": "tt1"}], cache, "tv")                   # gia in cache: nessuna chiamata
+            self.assertEqual(calls, [])
+            c.map_tmdb([{"imdb": "tt2"}, {"imdb": "tt3"}], cache, "movie")
+        self.assertEqual(cache["tt1"], {"tmdb": 1, "lang": "en"})
+        self.assertEqual(cache["tt2"], {"tmdb": 777, "lang": "it", "kind": "movie"})   # rimappata come film
+        self.assertEqual(cache["tt3"], {"tmdb": 777, "lang": "it", "kind": "movie"})
+
+    def test_un_404_non_ferma_il_pool_film(self):
+        import urllib.error
+        from unittest import mock
+        cands = [{"imdb": "tt1", "type": "movie", "start": 2022, "rating": 8.0, "votes": 90000, "genres": ["Drama"]},
+                 {"imdb": "tt2", "type": "movie", "start": 2022, "rating": 7.5, "votes": 90000, "genres": ["Drama"]}]
+        cache = {"tt1": {"tmdb": 1, "lang": "en", "kind": "movie"}, "tt2": {"tmdb": 2, "lang": "en", "kind": "movie"}}
+        seen = []
+
+        def services(tmdb_id, kind="tv"):
+            seen.append(kind)
+            if tmdb_id == 2:
+                raise urllib.error.HTTPError("u", 404, "Not Found", None, None)
+            return ["netflix"]
+
+        with mock.patch.object(c, "imdb_candidates", return_value=cands), mock.patch.object(c, "tmdb_services", services), \
+                mock.patch.object(c, "log", lambda m: None):
+            pool = c.section_pool(None, {}, cache, "movie")
+        self.assertEqual(pool["all"], [1])
+        self.assertEqual(set(seen), {"movie"})                 # provider chiesti su /movie, non su /tv
+        self.assertNotIn("tt2", cache)
+
+
+# Risposta reale di ESPN (uefa.champions, novembre 2026) ridotta a tre partite e ai campi usati.
+ESPN_UCL = {"events": [
+    {"date": "2026-11-24T17:45Z", "status": {"type": {"name": "STATUS_SCHEDULED"}}, "competitions": [{"competitors": [
+        {"homeAway": "home", "team": {"id": "432", "shortDisplayName": "Galatasaray", "displayName": "Galatasaray", "logo": "https://a.espncdn.com/i/teamlogos/soccer/500/432.png"}},
+        {"homeAway": "away", "team": {"id": "362", "shortDisplayName": "Aston Villa", "displayName": "Aston Villa", "logo": "https://a.espncdn.com/i/teamlogos/soccer/500/362.png"}}]}]},
+    {"date": "2026-11-24T20:00Z", "status": {"type": {"name": "STATUS_SCHEDULED"}}, "competitions": [{"competitors": [
+        {"homeAway": "home", "team": {"id": "382", "shortDisplayName": "Man City", "displayName": "Manchester City", "logo": "https://a.espncdn.com/i/teamlogos/soccer/500/382.png"}},
+        {"homeAway": "away", "team": {"id": "114", "shortDisplayName": "Napoli", "displayName": "Napoli", "logo": "https://a.espncdn.com/i/teamlogos/soccer/500/114.png"}}]}]},
+    {"date": "2026-11-25T20:00Z", "status": {"type": {"name": "STATUS_SCHEDULED"}}, "competitions": [{"competitors": [
+        {"homeAway": "home", "team": {"id": "160", "shortDisplayName": "PSG", "displayName": "Paris Saint-Germain", "logo": "https://a.espncdn.com/i/teamlogos/soccer/500/160.png"}},
+        {"homeAway": "away", "team": {"id": "104", "shortDisplayName": "AS Roma", "displayName": "AS Roma", "logo": "https://a.espncdn.com/i/teamlogos/soccer/500/104.png"}}]}]},
+]}
+ITALIAN = {"103", "104", "110", "114", "2572"}
+UTC = dt.timezone.utc
+
+
+class Sport(unittest.TestCase):
+    LO, HI = dt.datetime(2026, 11, 17, 23, tzinfo=UTC), dt.datetime(2026, 11, 25, 23, tzinfo=UTC)
+
+    def test_partite_champions_da_espn(self):
+        ev = c.espn_events(ESPN_UCL, "champions", ITALIAN, self.LO, self.HI)
+        self.assertEqual(ev[1], {"comp": "champions", "start": "2026-11-24T20:00:00Z", "home": "Manchester City",
+                                 "away": "Napoli", "home_logo": "https://a.espncdn.com/i/teamlogos/soccer/500/382.png",
+                                 "away_logo": "https://a.espncdn.com/i/teamlogos/soccer/500/114.png", "it": True})
+        self.assertEqual([(e["home"], e["away"], e["it"]) for e in ev],
+                         [("Galatasaray", "Aston Villa", False), ("Manchester City", "Napoli", True),
+                          ("PSG", "Roma", True)])                       # "AS Roma" -> "Roma"
+
+    def test_fuori_finestra_e_rinviate(self):
+        ev = c.espn_events(ESPN_UCL, "champions", ITALIAN, self.LO, dt.datetime(2026, 11, 24, 20, tzinfo=UTC))
+        self.assertEqual(len(ev), 1)                                    # fine esclusa
+        import copy
+        rinviata = copy.deepcopy(ESPN_UCL)
+        rinviata["events"][0]["status"]["type"]["name"] = "STATUS_POSTPONED"
+        self.assertEqual(len(c.espn_events(rinviata, "champions", ITALIAN, self.LO, self.HI)), 2)
+
+    def test_serie_a_sempre_italiana(self):
+        ev = c.espn_events(ESPN_UCL, "seriea", set(), self.LO, self.HI)
+        self.assertTrue(all(e["it"] for e in ev))
+
+    def test_nomi_squadre(self):
+        for espn_name, want in [("Inter Milan", "Inter"), ("Internazionale", "Inter"), ("AC Milan", "Milan"),
+                                ("Milan", "Milan"), ("AS Roma", "Roma"), ("Hellas Verona", "Verona"),
+                                ("Bayern", "Bayern Monaco"), ("Juventus", "Juventus")]:
+            self.assertEqual(c.team_name({"shortDisplayName": espn_name}), want)
+
+    def test_sessioni_f1(self):
+        races = [{"raceName": "Las Vegas Grand Prix", "date": "2026-11-22", "time": "04:00:00Z",
+                  "FirstPractice": {"date": "2026-11-20", "time": "00:30:00Z"},
+                  "ThirdPractice": {"date": "2026-11-21", "time": "00:30:00Z"},
+                  "Qualifying": {"date": "2026-11-21", "time": "04:00:00Z"}},
+                 {"raceName": "Qatar Grand Prix", "date": "2026-11-29", "time": "16:00:00Z",
+                  "SprintQualifying": {"date": "2026-11-27", "time": "17:30:00Z"},
+                  "Sprint": {"date": "2026-11-28", "time": "13:00:00Z"},
+                  "Qualifying": {"date": "2026-11-28", "time": "17:00:00Z"}},
+                 {"raceName": "Bahrain Grand Prix in Malaysia", "date": "2026-11-23", "time": None}]
+        ev = c.f1_events(races, self.LO, dt.datetime(2026, 12, 1, tzinfo=UTC))
+        self.assertEqual([(e["title"], e["session"], e["start"]) for e in ev], [
+            ("GP di Las Vegas", "Qualifiche", "2026-11-21T04:00:00Z"),      # niente prove libere
+            ("GP di Las Vegas", "Gara", "2026-11-22T04:00:00Z"),
+            ("GP del Qatar", "Qualifiche sprint", "2026-11-27T17:30:00Z"),
+            ("GP del Qatar", "Sprint", "2026-11-28T13:00:00Z"),
+            ("GP del Qatar", "Qualifiche", "2026-11-28T17:00:00Z"),
+            ("GP del Qatar", "Gara", "2026-11-29T16:00:00Z")])          # orario mancante: saltata
+        self.assertEqual(c.gp_name_it("Bahrain Grand Prix in Malaysia"), "Bahrain GP in Malaysia")
+
+    def test_finestra_8_giorni_ora_di_roma(self):
+        lo, hi = c.sport_window(dt.datetime(2026, 11, 18, 10, tzinfo=UTC))
+        self.assertEqual((lo, hi), (dt.datetime(2026, 11, 17, 23, tzinfo=UTC), dt.datetime(2026, 11, 25, 23, tzinfo=UTC)))
+        # alle 23:30 UTC a Roma e gia domani: la partita delle 23:30 del 25 e fuori, quella del 17 e dentro
+        sample = {"events": [dict(ESPN_UCL["events"][0], date=d) for d in ("2026-11-17T23:30Z", "2026-11-25T23:30Z")]}
+        self.assertEqual([e["start"] for e in c.espn_events(sample, "champions", ITALIAN, lo, hi)], ["2026-11-17T23:30:00Z"])
+        # alle 23:30 UTC del 18 (00:30 a Roma del 19) la finestra parte gia dal 19
+        self.assertEqual(c.sport_window(dt.datetime(2026, 11, 18, 23, 30, tzinfo=UTC))[0],
+                         dt.datetime(2026, 11, 18, 23, tzinfo=UTC))
+        # in estate (ora legale) mezzanotte di Roma e alle 22 UTC
+        self.assertEqual(c.sport_window(dt.datetime(2026, 7, 1, 12, tzinfo=UTC))[0], dt.datetime(2026, 6, 30, 22, tzinfo=UTC))
+
+    def test_mesi_espn(self):
+        self.assertEqual(c.espn_months(self.LO, self.HI), ["202611"])
+        self.assertEqual(c.espn_months(dt.datetime(2026, 11, 27, 23, tzinfo=UTC), dt.datetime(2026, 12, 5, 23, tzinfo=UTC)),
+                         ["202611", "202612"])
 
 
 if __name__ == "__main__":
