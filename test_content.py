@@ -121,5 +121,25 @@ class NuoveStagioni(unittest.TestCase):
                 self.assertEqual(c.season_counts(first, rating), want)
 
 
+class PoolSenzaSerieSparite(unittest.TestCase):
+    def test_un_404_di_tmdb_non_ferma_il_pool(self):
+        import urllib.error
+        from unittest import mock
+        cands = [{"imdb": "tt1", "type": "tvSeries", "start": 2021, "rating": 8.0, "votes": 90000, "genres": ["Drama"]},
+                 {"imdb": "tt2", "type": "tvSeries", "start": 2021, "rating": 7.5, "votes": 90000, "genres": ["Drama"]}]
+        cache = {"tt1": {"tmdb": 1, "lang": "en"}, "tt2": {"tmdb": 2, "lang": "en"}}
+
+        def services(tmdb_id):
+            if tmdb_id == 2:
+                raise urllib.error.HTTPError("u", 404, "Not Found", None, None)
+            return ["hbomax"]
+
+        with mock.patch.object(c, "imdb_candidates", return_value=cands), mock.patch.object(c, "tmdb_services", services),                 mock.patch.object(c, "log", lambda m: None):
+            pool = c.section_pool(None, {}, cache)
+        self.assertEqual(pool["all"], [1])
+        self.assertEqual(pool["items"][0]["s"], ["hbomax"])
+        self.assertNotIn("tt2", cache)                         # si rimappa alla prossima corsa
+
+
 if __name__ == "__main__":
     unittest.main()

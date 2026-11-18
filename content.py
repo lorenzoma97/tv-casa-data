@@ -1,7 +1,8 @@
 """Dati per la home della TV (fork lorenzoma97/cleanyourtv): docs/content.json, pubblicato su GitHub Pages.
 
 Regole concordate con Lorenzo (24-26 ott 2026):
-  Servizi attivi  Netflix (8), Prime Video (119, 2100 con pubblicita), RaiPlay (222), Mediaset Infinity (359), Italia.
+  Servizi attivi  Netflix (8), Prime Video (119, 2100 con pubblicita), RaiPlay (222), Mediaset Infinity (359),
+                  HBO Max (1899, dal 18 nov 2026; non il canale HBO Max dentro Prime, 1825), Italia.
                   NOW non e attivo: escluso.
   Pool serie      IMDb: tvSeries + tvMiniSeries, prima uscita dal 2020, almeno 25.000 voti (5.000 se in lingua
                   italiana); lingua originale inglese o europea (no coreane, anime, indiane); disponibili sui servizi
@@ -45,6 +46,7 @@ SERVICES = {
     "prime": {"name": "Prime Video", "package": "com.amazon.amazonvideo.livingroom", "providers": [119, 2100]},
     "raiplay": {"name": "RaiPlay", "package": "it.rainet.androidtv", "providers": [222]},
     "infinity": {"name": "Mediaset Infinity", "package": "it.mediaset.infinitytv", "providers": [359]},
+    "hbomax": {"name": "HBO Max", "package": "com.wbd.stream", "providers": [1899]},
 }
 PROVIDER_TO_SERVICE = {p: s for s, v in SERVICES.items() for p in v["providers"]}
 # Inglese ed europee (Turchia compresa), concordato il 26 ott. Fuori: ko, ja, zh, hi e altre lingue indiane, ar...
@@ -262,8 +264,21 @@ def section_pool(d, ratings, cache):
     map_tmdb(cands, cache)
     ok = [dict(c, **cache[c["imdb"]]) for c in cands
           if cache[c["imdb"]]["tmdb"] and eligible(c, cache[c["imdb"]]["lang"])]
+
+    def services(c):
+        try:
+            return tmdb_services(c["tmdb"])
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                raise
+            # Serie tolta o fusa su TMDB: fuori dal pool, e alla prossima corsa si rimappa da IMDb. Un solo 404 ha
+            # tenuto fermo tutto il pool dal 12 al 17 nov 2026.
+            cache.pop(c["imdb"], None)
+            log(f"pool: {c['imdb']} non e piu su TMDB ({c['tmdb']}), saltata")
+            return []
+
     with ThreadPoolExecutor(8) as ex:
-        for c, s in zip(ok, ex.map(lambda c: tmdb_services(c["tmdb"]), ok)):
+        for c, s in zip(ok, ex.map(services, ok)):
             c["services"] = s
     rows = [c for c in ok if c["services"]]
     items, all_ids, by_genre = build_pool(rows)
